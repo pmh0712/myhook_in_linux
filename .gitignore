@@ -1,0 +1,8 @@
+# 컴파일된 바이너리 및 라이브러리
+target
+injection
+*.so
+*.o
+
+# 디버그 로그 및 임시 파일
+.gdb_history
