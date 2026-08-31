@@ -18,8 +18,23 @@ RUN apt-get update && apt-get install -y \
     curl \
     sudo \
     libcapstone-dev \
-    libkeystone-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Keystone 소스 빌드 및 Capstone과 동일 경로(/usr)에 설치 후 소스 정리
+RUN cd /tmp && \
+    git clone https://github.com/keystone-engine/keystone.git && \
+    cd keystone && \
+    mkdir build && cd build && \
+    cmake -DCMAKE_INSTALL_PREFIX=/usr \
+          -DCMAKE_INSTALL_LIBDIR=lib/x86_64-linux-gnu \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_SHARED_LIBS=ON \
+          -DLLVM_TARGETS_TO_BUILD="all" \
+          -G "Unix Makefiles" .. && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    rm -rf /tmp/keystone
 
 # Pwndbg 설치
 RUN git clone https://github.com/pwndbg/pwndbg /opt/pwndbg && \
