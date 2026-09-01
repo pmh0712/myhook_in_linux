@@ -3,6 +3,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <stdint.h>
 #include <dlfcn.h>
 #include <capstone/capstone.h>
 #include "myutil.h"
@@ -66,12 +67,17 @@ bool is_rip_relative(cs_insn *insn){
 }
 
 
-// dlsym이 반환해주는 strcmp 주소는 IFUNC(Indirect Function)로 인해
-// CPU 하드웨어 지원 설정에 따라 런타임에 동적으로 결정되는 실제 함수의 진입점이므로,
-// 이 주소를 기준으로 처음 몇 바이트의 명령어를 백업한 뒤 JMP 코드를 덮어씌워
-// 안정적인 인라인 트램펄린(우회로)을 동적으로 생성 및 패치해야 한다.
-// 특히 백업할 명령어 중에 RIP 상대 주소(PC-relative)를 사용하는 명령어가 포함되어 있으면
-// 트램펄린이 할당된 메모리 위치에 맞춰 오프셋을 재계산해야 오류를 방지할 수 있다.
+/**
+ * @brief 인라인 훅(Inline Hook)을 위한 트램펄린 동적 생성 및 명령어 릴로케이션
+ * 
+ * 타겟 함수의 프롤로그(최소 14바이트)를 디코딩하여 트램펄린 버퍼로 복사한다.
+ * 복사 과정에서 다음의 주소 보정(Relocation) 작업을 수행한다:
+ *   1. RIP 상대 참조(Data): 트램펄린 위치에 맞춰 변위(Disp) 재계산
+ *   2. 상대 분기문(Branch): 도착지 절대 주소 보존 및 변위 재계산
+ *   3. Short 분기문: 오프셋 범위 확장(Expansion)을 위해 Near 분기문(5~6바이트)으로 뻥튀기 후 패치
+ * 
+ * @return 훅 생성 성공 여부 (true/false)
+ */
 bool build_trampoline()
 {
     //capstone 변수 세팅
@@ -98,7 +104,7 @@ bool build_trampoline()
     }
 
     //2GB 이내 거리에 트램펄린을 저장하기 위한 hint address(함수위치 + 16MB)
-    void* hint_address = (void*)((long)original_function +0x1000000);
+    void* hint_address = (void*)((long)original_function + 0x1000000);
     printf("hint_address: %lx\n", (long)hint_address);
 
     // mmap으로 트램펄린 공간 할당
@@ -107,8 +113,10 @@ bool build_trampoline()
         perror("mmap failed");
         return false;
     }
+
+    //2GB 바깥에 트램펄린이 생성 시 훅 생성 실패
     long distance = (long)trampoline_addr - (long)original_function;
-    if(distance < -0x7FFFFFFF || distance > 0x7FFFFFFF){
+    if(distance < INT32_MIN || distance > INT32_MAX){
         return false;
     }
 
@@ -119,34 +127,101 @@ bool build_trampoline()
     // 최소 14바이트가 넘을 때까지 원본 명령어를 몇 개 뜯어올지 계산
     for (size_t i = 0; i < count; i++){
         // 명령어 복사
-        memcpy(&trampoline_buf[trampoline_offset], insn[i].bytes,insn[i].size);
+        memcpy(&trampoline_buf[trampoline_offset], insn[i].bytes, insn[i].size);
+        //트램펄린의 현재 명령어 절대주소
+        uint64_t tram_abs_addr = (long)trampoline_addr + trampoline_offset;
+        //원래 주소가 가르키던 주소를 담을 저장공간
+        uint64_t orig_abs_addr = 0;
+        // 새로 갱신할 offset
+        int64_t new_offset = 0;
+        //명령어에 대한 정보
+        cs_x86 *x86 =  &(insn[i].detail->x86);
+
+        //원래 주소가 가르키던 곳(orig_abs_addr) 구하기
+        //rip 레지스터 상대주소 지정(rip + offset)을 쓰는 명령어들
         if(is_rip_relative(&insn[i])){
-            cs_x86 *x86 =  &(insn[i].detail->x86);
+            // MOV, LEA 같은 데이터 참조문은 disp를 더해서 직접 계산해야 함, capstone이 미리 만들어 주지 않음
+            orig_abs_addr = insn[i].address + insn[i].size + x86->disp;
+        }
 
-            //기존 명령어 오프셋 값(disp)
-            int32_t orig_disp = x86->disp;
+        // 직접 상대 분기문, 메모리 데이터 참조가 아닌 명령어 자체의 변위 사용 
+        else if(insn[i].bytes[0] == 0xE8 || //Direct CALL
+                insn[i].bytes[0] == 0xE9 || // Near JMP
+                insn[i].bytes[0] == 0xEB || // Short JMP
+                (insn[i].bytes[0] >=0x70 && insn[i].bytes[0] <= 0x7F) || //Short JCC
+                (insn[i].bytes[0] == 0x0F && (insn[i].bytes[1] >= 0x80 && insn[i].bytes[1] <= 0x8F))) //Near JCC
+        {
+            // CALL, JMP, JCC 같은 제어문은 imm 필드에 주소가 있음, capstone이 미리 절대주소를 계산해줌
+            orig_abs_addr = x86->operands[0].imm;      
+        }
 
-            //원래 명령어가 가르키면 절대 주소
-            uint64_t orig_abs_addr = insn[i].address+insn[i].size+orig_disp;
-            //트램펄린의 현재 명령어 절대주소
-            uint64_t tram_abs_addr = (long)trampoline_addr + trampoline_offset;
-            
-            //트램펄린 기준 오프셋 재계산
-            //새 오프셋 = 원래 절대주소 - (현태 트램펄린 명령어 주소 + 현재 명령어 길이)
-            int32_t new_disp = (uint32_t)(orig_abs_addr-(tram_abs_addr+insn[i].size));
-            
+        //rip에 영향받지 않는(위치 독립적인) 일반 명령어들
+        //오프셋 재계산 없이 바로 복사 가능
+        else{
+            accumulated_size += insn[i].size;
+            trampoline_offset += insn[i].size;
+            continue;
+        }
+
+        // 14바이트 뜯어오는 과정 중에 도착지가 있는지 확인 (내부 점프 판별)
+        // (총 잘라올 길이를 아직 모르니 넉넉하게 20바이트 이내로 잡고 거름)
+        bool is_internal = (orig_abs_addr >= (uint64_t)original_function) && 
+                           (orig_abs_addr < (uint64_t)original_function + 20);
+        if (is_internal) {
+            printf("Internal jump detected! Hook failed.\n");
+            cs_free(insn, count);
+            cs_close(&handle);
+            return false; 
+        }
+
+        //트램펄린 기준 오프셋 재계산
+        //새 오프셋 = 원래 절대주소 - (현재 트램펄린 명령어 주소 + 현재 명령어 길이)
+        new_offset = (int64_t)(orig_abs_addr-(tram_abs_addr+insn[i].size));
+
+        //새 오프셋이 +-2GB범위 초과 시 훅 생성 실패
+        if (new_offset >= INT32_MAX || new_offset <= INT32_MIN){
+            return false;
+        }
+
+        // CALL, near JMP, near JCC 처리(4바이트 오프셋으로 점프하는 명령어들)
+        if(insn[i].bytes[0] == 0xE8 ||
+           insn[i].bytes[0] == 0xE9 || 
+           (insn[i].bytes[0] == 0x0F && (insn[i].bytes[1] >= 0x80 && insn[i].bytes[1] <= 0x8F)))
+        {
+            // capstone이 알려주는 imm 오프셋 사용
+            uint8_t imm_offset = x86->encoding.imm_offset;
+            // 복사해둔 명령어의 imm 영역 덮어쓰기
+            *(int32_t*)(&trampoline_buf[trampoline_offset + imm_offset]) = (int32_t)new_offset;
+            //변경 전 명령어 길이와 동일 
+            trampoline_offset += insn[i].size;
+        }
+        // short JMP
+        else if(insn[i].bytes[0] == 0xEB)
+        {
+            *(uint8_t*)(&trampoline_buf[trampoline_offset]) = 0xE9; //Near JMP 명령어로 변경
+            *(int32_t*)(&trampoline_buf[trampoline_offset + 1]) = new_offset;
+            // short JMP(2byte) -> Near JMP(5byte)
+            trampoline_offset += 5;
+        }
+        // short jCC
+        else if(insn[i].bytes[0] >=0x70 && insn[i].bytes[0] <= 0x7F)
+        {
+            *(uint8_t*)(&trampoline_buf[trampoline_offset]) = 0x0F; //Near JCC 명령어로 변경
+            *(uint8_t*)(&trampoline_buf[trampoline_offset + 1]) = insn[i].bytes[0] + 0x10; //각 조건에 대응되는(+0x10) Near JCC로 변경
+            *(int32_t*)(&trampoline_buf[trampoline_offset + 2]) = new_offset;
+            // short JCC(2byte) -> Near JCC(6byte)
+            trampoline_offset += 6;
+        } 
+        //MOV, LEA, CMP, ADD와 같은 명령어 한꺼번에 처리
+        else{
             //복사해둔 명령어 오프셋 위치를 새로구한 오프셋으로 변경
             //캡스톤이 알려주는 오프셋 위치(disp_offset)을 활용
             uint8_t disp_offset = x86->encoding.disp_offset;
-            *(int32_t*)(&trampoline_buf[trampoline_offset + disp_offset]) = new_disp;
-
-            printf("[%ld] instructor changed!\n", i);
-            printf("abs_addr = %lx\n", orig_abs_addr);
-            printf("new offset: %x, trampoline cur addr: %lx\n", new_disp, tram_abs_addr);
-            printf("check new offset + trampoline cur addr = %lx\n", new_disp + tram_abs_addr + insn[i].size);
+            *(int32_t*)(&trampoline_buf[trampoline_offset + disp_offset]) = (int32_t)new_offset;
+            //변경 전 명령어 길이와 동일 
+            trampoline_offset += insn[i].size;
         }
         accumulated_size += insn[i].size;
-        trampoline_offset += insn[i].size;
 
         if (accumulated_size >= 14) break;
     }
@@ -178,14 +253,14 @@ bool build_trampoline()
 //우리가 실행시킬 훅 함수 이것도 타겟 함수에 맞춰 다시 만들어줘야한다
 void myfunction(void)
 {
-    printf("HOOKED!!!!\n");
+    printf("HOOKED!!!! 0x11ef\n");
     target_func_t return_original= (target_func_t)trampoline_addr; 
     return return_original();
 }
 
 void setup_hook() {
     //먼저 디버거를 이용한 분석을 통해 target의 오프셋을 획득
-    long target_offset = 0x1189;
+    long target_offset = 0x11ef;
 
     //프로그램, 라이브러리의 base를 획득
     pid_t mypid = getpid();
