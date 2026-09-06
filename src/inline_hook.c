@@ -88,6 +88,34 @@ bool is_rip_relative(cs_insn *insn){
     return false;
 }
 
+void* allocation_for_trampoline(uint64_t target_addr)
+{
+    void* allocated_addr = NULL;
+    uint64_t base_addr = target_addr & ~(0xFFF); //mmap할당 규칙에 맞춘 마스킹
+    bool flag = false;
+    for(long n = 1; (n * 0x1000)< INT32_MAX; n++){
+        for (int sign = 1; sign > -2; sign -= 2){
+            void* hint_addr = (void*)(base_addr + sign * n * 0x1000);
+            void* test_addr = mmap(hint_addr, 0x1000, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+
+            if(test_addr == MAP_FAILED) continue;
+
+            //2GB 바깥에 트램펄린이 생성 시 훅 생성 실패
+            long distance = (long)test_addr - (long)target_addr;
+
+            if(distance >= INT32_MIN && distance <= INT32_MAX){
+                flag = true;
+                allocated_addr = test_addr;
+                break;
+            }
+            munmap(test_addr, 0x1000);
+        }
+
+        if (flag) break;
+    }
+    return allocated_addr;
+}
+
 int search_destination(uint64_t orig_abs_addr, size_t count)
 {
     int j = 0;
@@ -315,22 +343,9 @@ bool build_trampoline()
         return false;
     }
 
-    //2GB 이내 거리에 트램펄린을 저장하기 위한 hint address(함수위치 + 16MB)
-    void* hint_address = (void*)((long)original_function + 0x1000000);
-    printf("hint_address: %lx\n", (long)hint_address);
-
-    // mmap으로 트램펄린 공간 할당
-    trampoline_addr = mmap(hint_address, 0x1000, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    if (trampoline_addr == MAP_FAILED) {
-        perror("mmap failed");
-        return false;
-    }
-
-    //2GB 바깥에 트램펄린이 생성 시 훅 생성 실패
-    long distance = (long)trampoline_addr - (long)original_function;
-    if(distance < INT32_MIN || distance > INT32_MAX){
-        return false;
-    }
+    // 트램펄린 공간 할당
+    trampoline_addr = allocation_for_trampoline((uint64_t)original_function);
+    if (trampoline_addr == NULL) return false;
 
     size_t original_len = one_PASS(insn, count);
 
@@ -347,7 +362,6 @@ bool build_trampoline()
         cs_close(&handle);
         return false;
      }
-     printf("final_len: %ld\n", final_len);
 
     //트램펄린으로 점프하기위한 점프 명령어 세팅
     unsigned char jmp_trampoline[14];
