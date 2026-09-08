@@ -21,7 +21,7 @@ typedef enum
 typedef struct inst_info
 {
     uint64_t original_addr;
-    uint64_t orig_abs_addr;
+    uint64_t dest_abs_addr;
     int trampoline_offset;
     uint8_t orig_size;
     uint8_t expand_size;
@@ -36,12 +36,12 @@ typedef struct hook_context
     void* hook_function;     //내가 만든 훅 함수 주소
     void* trampoline_addr;   //할당받은 트램펄린 주소
 
-    size_t original_len;     //잘라낸 명령어의 길이
+    size_t stolen_byte_size;     //잘라낸 명령어의 길이
     size_t relocated_len;   //분석 후 확장된 명령어의 길이
     size_t backup_stub_size;        //레지스터 백업 스텁 길이
     size_t final_trampoline_len; //최종 트램펄린 길이
 
-    size_t inst_count; // 트램펄린으로 훔쳐갈 실제 명령어 개수
+    size_t stolen_inst_count; // 트램펄린으로 훔쳐갈 실제 명령어 개수
 } HOOK_CONTEXT;
 
 //14바이트 점프 명령어 템플릿
@@ -190,30 +190,30 @@ int search_destination(uint64_t orig_abs_addr, INST_INFO* inst_info, size_t coun
  * 2차 패스에서 사용할 메타데이터(팽창 크기, 패치 타입, 트램펄린 내 오프셋)를 inst_info에 기록한다.
  * 
  * [핵심 로직]
- * - 길이 확보: 가변 길이 명령어를 자르다 보면 14바이트를 초과할 수 있으므로, 훔쳐갈 실제 바이트 수(original_len)와 명령어 개수(inst_count)를 확정
+ * - 길이 확보: 가변 길이 명령어를 자르다 보면 14바이트를 초과할 수 있으므로, 훔쳐갈 실제 바이트 수(stolen_byte_size)와 명령어 개수(stolen_inst_count)를 확정
  * - 내부/외부 분기 판별: 분기문의 목적지가 우리가 훔쳐갈 명령어들(prologue 영역) 내부인지 외부인지 판별
  * - 팽창(Expansion) 예측: 외부로 뛰는 Short JMP(2b)/JCC(2b)는 거리가 멀어질 것에 대비해 트램펄린에서 Near JMP(5b)/JCC(6b)로 팽창하도록 크기 예약
  * 
  * @return bool 14바이트 이상 확보 성공 여부
  */
-bool one_PASS(HOOK_CONTEXT* ctx, INST_INFO* inst_info, cs_insn *insn)
+bool analyze_insts(HOOK_CONTEXT* ctx, INST_INFO* inst_info, cs_insn *insn)
 {
-    size_t accumulated_size = 0;
+    size_t measured_byte_size = 0;
     size_t trampoline_offset = 0;
-    size_t inst_count = 0;
+    size_t parsed_inst_count = 0;
 
-    for(int i = 0; i < ctx->inst_count && accumulated_size < 14;i++){
-        accumulated_size += insn[i].size;
-        inst_count++;
+    for(int i = 0; i < ctx->stolen_inst_count && measured_byte_size < 14;i++){
+        measured_byte_size += insn[i].size;
+        parsed_inst_count++;
     }
-    if (accumulated_size < 14) return false;
-    ctx->original_len = accumulated_size;
-    ctx->inst_count = inst_count;
+    if (measured_byte_size < 14) return false;
+    ctx->stolen_byte_size = measured_byte_size;
+    ctx->stolen_inst_count = parsed_inst_count;
 
     uint64_t prologue_start = insn[0].address;
-    uint64_t prologue_end = prologue_start + ctx->original_len;
+    uint64_t prologue_end = prologue_start + ctx->stolen_byte_size;
 
-    for(int i = 0; i < ctx->inst_count; i++){
+    for(int i = 0; i < ctx->stolen_inst_count; i++){
         cs_x86 *x86 =  &(insn[i].detail->x86);
         inst_info[i].original_addr = (uint64_t)insn[i].address;
         inst_info[i].trampoline_offset = trampoline_offset;
@@ -222,7 +222,7 @@ bool one_PASS(HOOK_CONTEXT* ctx, INST_INFO* inst_info, cs_insn *insn)
         //rip 레지스터 상대주소 지정(rip + offset)을 쓰는 명령어들
         if(is_rip_relative(&insn[i])){
             // MOV, LEA 같은 데이터 참조문은 disp를 더해서 직접 계산해야 함, capstone이 미리 만들어 주지 않음
-            inst_info[i].orig_abs_addr = insn[i].address + insn[i].size + x86->disp;
+            inst_info[i].dest_abs_addr = insn[i].address + insn[i].size + x86->disp;
             inst_info[i].expand_size = insn[i].size;
             inst_info[i].patch_offset = x86->encoding.disp_offset;
             inst_info[i].patch_type = PATCH_RIP_DATA;
@@ -238,12 +238,12 @@ bool one_PASS(HOOK_CONTEXT* ctx, INST_INFO* inst_info, cs_insn *insn)
         {
             // 점프해서 도착하는 곳
             // 분기문은 imm 필드에 목적지 주소가 있음. Capstone이 현재 명령어 주소를 기준으로 절대 주소를 산출해 둔 상태임
-            inst_info[i].orig_abs_addr = x86->operands[0].imm;
+            inst_info[i].dest_abs_addr = x86->operands[0].imm;
             inst_info[i].patch_offset = x86->encoding.imm_offset;
 
             // 점프/분기문인 경우 트램펄린에서 트램펄린 내부로 점프해야하는 경우가 존재함
             // 잘라낸 명령어 안으로 점프하는 경우 명령어 길이의 변화는 없다.
-            if(inst_info[i].orig_abs_addr >= prologue_start && inst_info[i].orig_abs_addr < prologue_end){
+            if(inst_info[i].dest_abs_addr >= prologue_start && inst_info[i].dest_abs_addr < prologue_end){
                 inst_info[i].expand_size = insn[i].size;
                 inst_info[i].patch_type = PATCH_INTERNAL;
                 trampoline_offset += insn[i].size;
@@ -275,7 +275,7 @@ bool one_PASS(HOOK_CONTEXT* ctx, INST_INFO* inst_info, cs_insn *insn)
         }
         // 분기문/점프문이 아닌 명령어들은 그대로간다
         else{
-            inst_info[i].orig_abs_addr = 0;  //참조하거나 점프 목적지가 없으므로 0
+            inst_info[i].dest_abs_addr = 0;  //참조하거나 점프 목적지가 없으므로 0
             inst_info[i].expand_size = insn[i].size; //명령어 길이 유지
             inst_info[i].patch_offset = 0;   //바꾸어야할 부분이 없으니 0
             inst_info[i].patch_type = PATCH_NONE;
@@ -301,23 +301,23 @@ bool one_PASS(HOOK_CONTEXT* ctx, INST_INFO* inst_info, cs_insn *insn)
  * 
  * @return bool 오프셋이 +-2GB(INT32) 범위를 벗어나지 않고 정상적으로 릴로케이션 되었는지 여부
  */
-bool two_PASS(HOOK_CONTEXT* ctx, INST_INFO* inst_info)
+bool build_relocated_trampoline(HOOK_CONTEXT* ctx, INST_INFO* inst_info)
 {
     uint8_t *trampoline_ptr = (uint8_t*)ctx->trampoline_addr + ctx->backup_stub_size; // 레지스터 상태 저장/복구 파트 반영
 
     // 최소 14바이트가 넘을 때까지 원본 명령어를 몇 개 뜯어올지 계산
-    for (size_t i = 0; i < ctx->inst_count; i++){
-        long t_offset = inst_info[i].trampoline_offset;
+    for (size_t i = 0; i < ctx->stolen_inst_count; i++){
+        long tram_rel_offset = inst_info[i].trampoline_offset;
         // 명령어 복사
-        memcpy((void*)(&trampoline_ptr[t_offset]), (void*)inst_info[i].original_addr, inst_info[i].orig_size);
+        memcpy((void*)(&trampoline_ptr[tram_rel_offset]), (void*)inst_info[i].original_addr, inst_info[i].orig_size);
         //트램펄린의 현재 명령어 절대주소
-        uint64_t tram_abs_addr = (uint64_t)(trampoline_ptr + t_offset);
+        uint64_t tram_abs_addr = (uint64_t)(trampoline_ptr + tram_rel_offset);
         // 새로 갱신할 offset
-        int64_t new_offset = inst_info[i].orig_abs_addr - (tram_abs_addr + inst_info[i].expand_size);
+        int64_t patched_offset = inst_info[i].dest_abs_addr - (tram_abs_addr + inst_info[i].expand_size);
 
         if (!(inst_info[i].patch_type == PATCH_NONE) && !(inst_info[i].patch_type == PATCH_INTERNAL)){
             //점프하거나 참조해야할 주소의 새 오프셋이 +-2GB범위 초과 시 훅 생성 실패
-            if (new_offset >= INT32_MAX || new_offset <= INT32_MIN){
+            if (patched_offset >= INT32_MAX || patched_offset <= INT32_MIN){
                 printf("allocation fail in 2GB distance\n");
                 return false;
             }
@@ -328,26 +328,26 @@ bool two_PASS(HOOK_CONTEXT* ctx, INST_INFO* inst_info)
             case PATCH_NONE:
                 break;
             case PATCH_INTERNAL:{
-                int idx = search_destination(inst_info[i].orig_abs_addr, inst_info, ctx->inst_count);
+                int idx = search_destination(inst_info[i].dest_abs_addr, inst_info, ctx->stolen_inst_count);
                 if(idx == -1) return 0;
-                int8_t short_offset = inst_info[idx].trampoline_offset - (t_offset + inst_info[i].expand_size); 
-                trampoline_ptr[t_offset+inst_info[i].patch_offset] = short_offset;
+                int8_t short_offset = inst_info[idx].trampoline_offset - (tram_rel_offset + inst_info[i].expand_size); 
+                trampoline_ptr[tram_rel_offset+inst_info[i].patch_offset] = short_offset;
                 break;
             }
             case PATCH_NEAR_BRANCH:
             case PATCH_RIP_DATA:
-                printf("is it RIP right? %d, %lx\n", inst_info[i].patch_type, new_offset);
-                *(int32_t*)(&trampoline_ptr[t_offset + inst_info[i].patch_offset]) = new_offset;
+                printf("is it RIP right? %d, %lx\n", inst_info[i].patch_type, patched_offset);
+                *(int32_t*)(&trampoline_ptr[tram_rel_offset + inst_info[i].patch_offset]) = patched_offset;
                 break;
             case PATCH_EXPAND_JMP:
-                trampoline_ptr[t_offset] = 0xE9; //Near JMP 명령어로 변경
-                *(int32_t*)(&trampoline_ptr[t_offset + 1]) = new_offset;
+                trampoline_ptr[tram_rel_offset] = 0xE9; //Near JMP 명령어로 변경
+                *(int32_t*)(&trampoline_ptr[tram_rel_offset + 1]) = patched_offset;
                 break;
             case PATCH_EXPAND_JCC:{
-                uint8_t control_op = trampoline_ptr[t_offset];
-                trampoline_ptr[t_offset] = 0x0F; //Near JCC 명령어로 변경
-                trampoline_ptr[t_offset + 1] = control_op + 0x10; //각 조건에 대응되는(+0x10) Near JCC로 변경
-                *(int32_t*)(&trampoline_ptr[t_offset + 2]) = new_offset;
+                uint8_t control_op = trampoline_ptr[tram_rel_offset];
+                trampoline_ptr[tram_rel_offset] = 0x0F; //Near JCC 명령어로 변경
+                trampoline_ptr[tram_rel_offset + 1] = control_op + 0x10; //각 조건에 대응되는(+0x10) Near JCC로 변경
+                *(int32_t*)(&trampoline_ptr[tram_rel_offset + 2]) = patched_offset;
                 break;
             }
             default: 
@@ -392,9 +392,9 @@ bool build_trampoline(HOOK_CONTEXT *ctx)
 
     // 훅을 걸기위해 14바이트 이상 명령어를 덮어써야함
     // 널널하게 32바이트 정도 디스어셈블
-    ctx->inst_count = cs_disasm(handle, (const uint8_t*)ctx->original_function, 32, (uint64_t)ctx->original_function, 0, &insn);
+    ctx->stolen_inst_count = cs_disasm(handle, (const uint8_t*)ctx->original_function, 32, (uint64_t)ctx->original_function, 0, &insn);
 
-    if (ctx->inst_count == 0){
+    if (ctx->stolen_inst_count == 0){
         printf("disasmble failed!!\n");
         return false;
     }
@@ -403,42 +403,42 @@ bool build_trampoline(HOOK_CONTEXT *ctx)
     ctx->trampoline_addr = allocation_for_trampoline((uint64_t)ctx->original_function);
     if (ctx->trampoline_addr == NULL) return false;
 
-    uint8_t* t_base = (uint8_t*)ctx->trampoline_addr;
+    uint8_t* tram_base_ptr = (uint8_t*)ctx->trampoline_addr;
     //레지스터 백업 스텁 세팅
-    memcpy((void*)t_base, HOOK_STUB_TEMPLATE, 80);
+    memcpy((void*)tram_base_ptr, HOOK_STUB_TEMPLATE, 80);
     // 훅 함수 저장
-    *(uint64_t*)(&t_base[HOOK_JMP_OFFSET]) = (uint64_t)ctx->hook_function;
+    *(uint64_t*)(&tram_base_ptr[HOOK_JMP_OFFSET]) = (uint64_t)ctx->hook_function;
     printf("myfunction: %lx\n", (long)ctx->hook_function);
     ctx->backup_stub_size = 80;
     ctx->final_trampoline_len += ctx->backup_stub_size;
     
     INST_INFO inst_info[32] = {0};
-    if (!one_PASS(ctx, inst_info, insn)){
+    if (!analyze_insts(ctx, inst_info, insn)){
         printf("this function is too short!! (function length < 14bytes)\n");
-        cs_free(insn, ctx->inst_count);
+        cs_free(insn, ctx->stolen_inst_count);
         cs_close(&handle);
         return false;
     }
 
-    cs_free(insn, ctx->inst_count); 
+    cs_free(insn, ctx->stolen_inst_count); 
     cs_close(&handle);
 
-     if (!two_PASS(ctx, inst_info)){
+     if (!build_relocated_trampoline(ctx, inst_info)){
         return false;
      }
      printf("ctx->relocated_len: %ld\n", ctx->relocated_len);
      ctx->final_trampoline_len += ctx->relocated_len;
 
     // 원본 함수의 훔쳐온 영역(14바이트) 바로 다음으로 복귀하는 점프 명령어 세팅
-    unsigned char jmp_original[14];
-    memcpy(jmp_original, JMP_TEMPLATE, 14);
+    unsigned char jmp_return_orig[14];
+    memcpy(jmp_return_orig, JMP_TEMPLATE, 14);
 
     // 돌아갈 주소 계산 및 JMP 조립 (64비트 절대주소 점프) -> 잘라온 명령어 만큼 주소 계산
-    long return_addr = (long)ctx->original_function + ctx->original_len;
-    *(long*)(&jmp_original[6]) = return_addr;
+    long return_addr = (long)ctx->original_function + ctx->stolen_byte_size;
+    *(long*)(&jmp_return_orig[6]) = return_addr;
 
     // 만들어진 트램펄린 바로 뒤에 JMP 기계어 이어 붙이기 -> 명령어의 길이 변화로 잘라낸 명령어보다 트램펄린의 길이가 길어지므로 트램펄린의 최종 길이를 사용 
-    memcpy((void*)((long)ctx->trampoline_addr + ctx->final_trampoline_len), jmp_original, 14);
+    memcpy((void*)((long)ctx->trampoline_addr + ctx->final_trampoline_len), jmp_return_orig, 14);
     ctx->final_trampoline_len += 14;
     return true;
 }
@@ -479,13 +479,13 @@ void setup_hook() {
     }
     printf("trampoline_addr: 0x%lx\n", (long)ctx.trampoline_addr);
     //원본 함수의 프롤로그를 덮어써서 트램펄린으로 진입하게 만드는 14바이트 점프 패치
-    unsigned char jmp_trampoline[14];
-    memcpy(jmp_trampoline, JMP_TEMPLATE, 14);
+    unsigned char jmp_hook_patch[14];
+    memcpy(jmp_hook_patch, JMP_TEMPLATE, 14);
 
     //6번 인덱스에 훅 함수의 주소를 저장
-    *((uint64_t*)(&jmp_trampoline[6])) = (uint64_t)ctx.trampoline_addr;
+    *((uint64_t*)(&jmp_hook_patch[6])) = (uint64_t)ctx.trampoline_addr;
     //mprotect로 쓰기 권한을 얻은 공간에 overwrite
-    memcpy((void*)ctx.original_function, jmp_trampoline, 14);
+    memcpy((void*)ctx.original_function, jmp_hook_patch, 14);
     //쓰기권한 해제
     protect_memory((long)ctx.original_function);
 
